@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "meeting-notes"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "pyannote.audio>=3.1.0",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    "openai>=1.30.0",
+    "rich>=13.7.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+meeting-notes = "meeting_notes.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["meeting_notes*"]
