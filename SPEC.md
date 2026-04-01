@@ -2,7 +2,7 @@
 
 ## Overview
 
-A fully local, lightweight CLI tool for recording and transcribing meeting audio in real time. Audio is transcribed using `faster-whisper` running in-process; a local LLM served by LM Studio generates a summary with action items on exit.
+A fully local, lightweight CLI tool for recording and transcribing meeting audio in real time. Audio is transcribed using `faster-whisper` running in-process; speaker diarization via `pyannote.audio` labels each segment by speaker (Speaker 1, Speaker 2, …); a local LLM served by LM Studio generates a summary with action items on exit.
 
 No cloud services. No persistent background daemon. One command to start, one to stop.
 
@@ -12,13 +12,16 @@ No cloud services. No persistent background daemon. One command to start, one to
 
 ### Startup
 - Launched via `meeting-notes` terminal command (after pip install)
-- Immediately begins capturing microphone audio
+- Immediately begins capturing audio from the selected input device (default: system default microphone)
 - Checks LM Studio connectivity at startup and warns if unreachable
-- Downloads Whisper model on first run (shows progress spinner); subsequent runs use cache
+- Downloads Whisper and pyannote models on first run (shows progress spinner); subsequent runs use cache
 
 ### Recording & Transcription
-- Captures microphone at 16 kHz, mono, float32 (Whisper's native format)
+- Captures audio at 16 kHz, mono, float32 (Whisper's native format)
 - Transcribes in rolling 30-second chunks using `faster-whisper`
+- Each chunk is diarized with `pyannote.audio` to assign speaker labels before transcription
+- Transcript lines are annotated: `[Speaker 1]: text`, `[Speaker 2]: text`, etc.
+- Speaker labels are consistent within a session (Speaker 1 is always the same voice)
 - Live transcript displayed in terminal, updating as each chunk completes
 - Transcript appended incrementally to `notes/YYYY-MM-DD_HH-MM.txt` (crash-safe)
 
@@ -31,8 +34,8 @@ No cloud services. No persistent background daemon. One command to start, one to
 - If LM Studio is unreachable at summary time, raw transcript is saved and displayed instead
 
 ### Output Files
-- `notes/YYYY-MM-DD_HH-MM.txt` — raw transcript, written incrementally during session
-- `notes/YYYY-MM-DD_HH-MM_summary.txt` — summary + action items, written at exit
+- `notes/YYYY-MM-DD_HH-MM.txt` — speaker-annotated transcript, written incrementally during session
+- `notes/YYYY-MM-DD_HH-MM_summary.txt` — summary + action items (with speaker attribution where possible), written at exit
 
 ---
 
@@ -55,22 +58,29 @@ Options:
   --url TEXT                  LM Studio base URL (default: http://localhost:1234/v1)
   --output PATH               Notes output directory (default: ./notes)
   --chunk-duration INT        Audio chunk size in seconds for transcription (default: 30)
+  --device TEXT               Input device name or index (default: system default mic)
+  --list-devices              Print available audio input devices and exit
+  --no-diarize                Disable speaker diarization (plain transcript, no speaker labels)
   --help                      Show this message and exit
 ```
+
+Use `meeting-notes --list-devices` to find the name of an aggregate device (e.g. for virtual meeting capture — see Audio Setup below).
 
 ---
 
 ## Architecture
 
 ```
-Microphone
+Audio Input Device (mic / aggregate device)
     │ PCM float32 @ 16kHz (sounddevice callback)
     ▼
 audio_queue: Queue[np.ndarray]
     │ accumulates until chunk_duration seconds reached
     ▼
-Transcriber (Thread)
-    │ faster_whisper.WhisperModel.transcribe()
+Transcription+Diarization Worker (Thread)
+    │ 1. pyannote.audio  → speaker segments [(start, end, speaker_id), ...]
+    │ 2. faster_whisper  → text per segment
+    │ 3. merge           → "[Speaker N]: text"
     ▼
 transcript_buffer (thread-safe list + Lock)
     │ written to notes/YYYY-MM-DD_HH-MM.txt
@@ -85,8 +95,8 @@ notes/YYYY-MM-DD_HH-MM_summary.txt
 
 **Threading model:** 3 threads
 1. Main thread — terminal UI (Rich Live), signal handling
-2. Audio thread — sounddevice InputStream callback pushing to queue
-3. Transcription worker thread — blocking faster-whisper calls
+2. Audio thread — sounddevice InputStream callback pushing PCM frames to queue
+3. Transcription worker thread — diarization + faster-whisper calls (blocking, per chunk)
 
 ---
 
@@ -94,11 +104,68 @@ notes/YYYY-MM-DD_HH-MM_summary.txt
 
 | Component | Library | Reason |
 |---|---|---|
-| Audio capture | `sounddevice` | Clean API over PortAudio; native CoreAudio on macOS |
+| Audio capture | `sounddevice` | Clean API over PortAudio; native CoreAudio on macOS; supports device selection |
 | Speech-to-text | `faster-whisper` | 4x faster than openai-whisper; CTranslate2 Metal on ARM64 |
+| Speaker diarization | `pyannote.audio` | State-of-the-art local diarization; works on same audio array as Whisper |
 | LLM client | `openai` | LM Studio speaks OpenAI-compatible API |
 | Terminal UI | `rich` | Live panels, spinners, formatted output |
 | Audio buffers | `numpy` | Required by faster-whisper and sounddevice |
+
+---
+
+## Speaker Diarization
+
+`pyannote.audio` runs locally in-process on the same audio chunk as faster-whisper.
+
+**Pipeline:**
+1. `pyannote.audio` `Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")` segments the audio chunk into `(start_sec, end_sec, speaker_id)` tuples
+2. faster-whisper transcribes each speaker segment individually
+3. Segments are merged into annotated lines: `[Speaker 1]: Hello, let's get started.`
+4. Speaker IDs from pyannote (`SPEAKER_00`, `SPEAKER_01`, …) are mapped to human-readable labels (`Speaker 1`, `Speaker 2`, …) and kept consistent across chunks within a session
+
+**Prerequisites:**
+- Free HuggingFace account required
+- Must accept model license at: `hf.co/pyannote/speaker-diarization-3.1` and `hf.co/pyannote/segmentation-3.0`
+- HuggingFace token set via `HF_TOKEN` environment variable (or `~/.huggingface/token`)
+
+**`--no-diarize` flag:** skips pyannote entirely; transcript is plain text without speaker labels. Useful when diarization is not needed or HF token is unavailable.
+
+---
+
+## Audio Setup
+
+### In-person meetings (default)
+
+No special setup needed. The default system microphone captures all speakers in the room.
+
+```bash
+meeting-notes
+```
+
+### Virtual meetings (Zoom, Teams, Meet, etc.)
+
+Remote participants' audio comes through your speakers/headphones — not the microphone. To capture both your voice and remote voices, use a virtual audio loopback device.
+
+**Required tool: [BlackHole](https://github.com/ExistentialAudio/BlackHole)** (free, open source)
+
+```bash
+brew install blackhole-2ch
+```
+
+**One-time macOS Audio MIDI Setup:**
+1. Open **Audio MIDI Setup** (`/Applications/Utilities/`)
+2. Create a **Multi-Output Device**: check BlackHole 2ch + your speakers/headphones
+   - Set this as your system output so you still hear audio
+3. Create an **Aggregate Device**: check your microphone + BlackHole 2ch
+   - Name it e.g. `Meeting Capture`
+
+**Run with the aggregate device:**
+```bash
+meeting-notes --list-devices          # find the name of your aggregate device
+meeting-notes --device "Meeting Capture"
+```
+
+In your meeting app (Zoom etc.), set audio output to the **Multi-Output Device**.
 
 ---
 
@@ -136,8 +203,8 @@ meeting-notes/
 ├── meeting_notes/
 │   ├── __init__.py
 │   ├── main.py          # Entry point, orchestrator, signal handling
-│   ├── audio.py         # AudioCapture — sounddevice wrapper
-│   ├── transcriber.py   # Transcriber — faster-whisper wrapper
+│   ├── audio.py         # AudioCapture — sounddevice wrapper, device listing
+│   ├── transcriber.py   # Transcriber — pyannote diarization + faster-whisper
 │   ├── summarizer.py    # Summarizer — LM Studio OpenAI client
 │   ├── display.py       # TerminalUI — Rich live display
 │   └── config.py        # Config dataclass + argparse
@@ -151,15 +218,27 @@ meeting-notes/
 ## Setup
 
 ```bash
-# One-time setup
+# One-time system dependencies
 brew install portaudio
+brew install blackhole-2ch  # optional: only for virtual meeting audio capture
+
+# Python environment
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
+# HuggingFace token (required for pyannote speaker diarization)
+export HF_TOKEN=hf_your_token_here   # add to ~/.zshrc to persist
+# Accept model licenses at:
+#   https://hf.co/pyannote/speaker-diarization-3.1
+#   https://hf.co/pyannote/segmentation-3.0
+
 # Run
-meeting-notes
-meeting-notes --model small
+meeting-notes                                        # in-person meeting (default mic)
+meeting-notes --model small                          # higher accuracy
+meeting-notes --no-diarize                           # no speaker labels
+meeting-notes --list-devices                         # show available audio devices
+meeting-notes --device "Meeting Capture"             # virtual meeting aggregate device
 meeting-notes --url http://localhost:1234/v1 --output ~/my-notes
 ```
 
@@ -170,8 +249,12 @@ meeting-notes --url http://localhost:1234/v1 --output ~/my-notes
 | Issue | Mitigation |
 |---|---|
 | macOS microphone permission | Clear error message pointing to System Settings > Privacy > Microphone |
-| First-run model download (~145MB) | Spinner + "Downloading Whisper model..." message |
+| First-run model download (~145MB Whisper + ~150MB pyannote) | Spinner + "Downloading models..." message; one-time only |
 | Whisper word cut at chunk boundary | 2-second overlap between consecutive chunks; deduplicate on text side |
+| Speaker ID drift across chunks | Session-level speaker registry maps pyannote IDs to stable `Speaker N` labels |
+| Single speaker in recording | Diarization still works; all lines annotated `[Speaker 1]` |
+| pyannote HF token missing | Clear error with link to HuggingFace token page; suggest `--no-diarize` as fallback |
 | LM Studio running but no model loaded | Catch 400/503, print actionable message, save raw transcript |
 | Second Ctrl+C during shutdown | Force-exit immediately |
 | Empty/silent recording | Silence segments discarded; summary prompt handles short transcripts gracefully |
+| BlackHole not installed (virtual meetings) | `--list-devices` shows available devices; user sees no aggregate device and can follow setup guide |
