@@ -16,7 +16,6 @@ A fully local CLI tool for recording and transcribing meeting audio in real time
 - macOS (Apple Silicon recommended)
 - Python 3.9+
 - [LM Studio](https://lmstudio.ai) running with a chat model loaded
-- Free [HuggingFace](https://huggingface.co) account (for speaker diarization models)
 
 ## Setup
 
@@ -28,16 +27,27 @@ brew install portaudio
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-
-# 3. Set your HuggingFace token
-export HF_TOKEN=hf_your_token_here   # add to ~/.zshrc to persist
 ```
 
-Accept the pyannote model licenses (one-time, free):
-- https://hf.co/pyannote/speaker-diarization-3.1
-- https://hf.co/pyannote/segmentation-3.0
-
 Or run `bash setup.sh` to go through all steps interactively.
+
+### Speaker diarization (one-time download)
+
+The app runs fully locally. However, the pyannote speaker diarization models have a gated license on HuggingFace — you need to accept the terms once before the model files can be downloaded to your machine. After that, no account or internet connection is needed.
+
+1. Create a free account at https://huggingface.co
+2. Accept the model licenses (click *Agree*):
+   - https://hf.co/pyannote/speaker-diarization-3.1
+   - https://hf.co/pyannote/segmentation-3.0
+3. Generate a token at https://hf.co/settings/tokens
+4. Set the token for the first run:
+   ```bash
+   export HF_TOKEN=hf_your_token_here   # add to ~/.zshrc to persist
+   ```
+
+The models (~300 MB total) are downloaded once to `~/.cache/huggingface/` and reused on every subsequent run. The token is not used at inference time.
+
+To skip this entirely, run with `--no-diarize` — transcription still works, just without speaker labels.
 
 ## Usage
 
